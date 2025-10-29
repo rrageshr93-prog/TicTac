@@ -1,0 +1,1494 @@
+import React, { useState, useMemo, useCallback, useEffect } from 'react';
+import { RefreshCcw, X, Circle, Link, Gamepad2, Users, Loader2, AlertTriangle, Shield } from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { 
+    getFirestore, doc, onSnapshot, setDoc, updateDoc, getDoc, 
+    collection, query, where, getDocs, limit, setLogLevel, runTransaction
+} from 'firebase/firestore';
+
+// --- GLOBAL VARIABLES (Provided by the environment) ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// --- GAME LOGIC FUNCTIONS ---
+
+/**
+ * Checks for a winner across 9 elements.
+ */
+function calculateWinner(squares) {
+    const lines = [
+        [0, 1, 2], [3, 4, 5], [6, 7, 8], // Rows
+        [0, 3, 6], [1, 4, 7], [2, 5, 8], // Columns
+        [0, 4, 8], [2, 4, 6],           // Diagonals
+    ];
+    for (let i = 0; i < lines.length; i++) {
+        const [a, b, c] = lines[i];
+        if (squares[a] && squares[a] === squares[b] && squares[a] === squares[c]) {
+            return { winner: squares[a], line: lines[i] };
+        }
+    }
+    return null;
+}
+
+/**
+ * Checks if a board is completely full.
+ */
+function isBoardFull(squares) {
+    return squares.every(Boolean);
+}
+
+// --- REACT COMPONENTS (Square, MiniBoard, InputField) ---
+
+const Square = React.memo(({ value, onClick, disabled }) => {
+    let textColor = value === 'X' ? 'text-cyan-400' : 'text-pink-400';
+    
+    return (
+        <button
+            className={`
+                w-full h-full text-2xl font-bold p-1
+                bg-slate-800/50 rounded-md shadow-md 
+                flex items-center justify-center transition-all duration-150
+                ${disabled ? 'cursor-not-allowed opacity-50' : 'hover:bg-slate-700/70'}
+            `}
+            onClick={onClick}
+            disabled={value !== null || disabled}
+        >
+            {value === 'X' && <X size={28} className={textColor} />}
+            {value === 'O' && <Circle size={25} className={textColor} />}
+        </button>
+    );
+});
+
+const MiniBoard = React.memo(({ boardId, squares, winner, isNextBoard, overallWinner, onSquareClick }) => {
+    
+    let boardClass = 'bg-slate-700 p-2 rounded-lg shadow-inner transition-all duration-300 relative';
+    
+    if (overallWinner) {
+        boardClass += ' opacity-70';
+    } else if (winner) {
+        boardClass += ` shadow-2xl ${winner === 'X' ? 'border-4 border-cyan-400' : 'border-4 border-pink-400'}`;
+    } else if (isNextBoard) {
+        boardClass += ' shadow-2xl ring-4 ring-offset-1 ring-offset-slate-900 ring-yellow-500/80 scale-[1.02]';
+    } else {
+        boardClass += ' opacity-80';
+    }
+
+    return (
+        <div className={boardClass}>
+            {winner ? (
+                <div className="absolute inset-0 flex items-center justify-center bg-slate-900/80 rounded-lg">
+                    {winner === 'X' ? 
+                        <X size={80} className="text-cyan-400 opacity-60" /> : 
+                        <Circle size={75} className="text-pink-400 opacity-60" />
+                    }
+                </div>
+            ) : (
+                <div className="grid grid-cols-3 gap-1 aspect-square">
+                    {squares.map((value, i) => (
+                        <Square 
+                            key={i} 
+                            value={value} 
+                            onClick={() => onSquareClick(boardId, i)}
+                            disabled={overallWinner || (!isNextBoard && boardId !== 9)}
+                        />
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+});
+
+const InputField = React.memo(({ player, label, color, value, onChange }) => (
+    <div className="mb-4">
+        <label className={`block text-lg font-medium ${color} mb-2`}>
+            {label}
+        </label>
+        <input
+            key={`input-${player}`} 
+            type="text"
+            value={value}
+            onChange={onChange}
+            placeholder={`Enter name for Player ${player}`}
+            maxLength={15}
+            className="w-full p-3 bg-slate-700/80 border border-slate-600 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-yellow-500 focus:border-yellow-500 outline-none transition-colors"
+        />
+    </div>
+));
+
+
+const NameInputScreen = ({ onSetPlayerName }) => { 
+    const [inputName, setInputName] = useState(''); 
+    const isReady = inputName.trim().length > 0;
+
+    return (
+        <div className="p-6 bg-slate-800 rounded-xl shadow-2xl border border-slate-700 w-full max-w-sm mx-auto">
+            <h2 className="text-3xl font-extrabold text-white mb-6 text-center">
+                Enter Your Player Name
+            </h2>
+            
+            <InputField 
+                player="self" 
+                label="Your Name" 
+                color="text-yellow-400" 
+                value={inputName}
+                onChange={(e) => setInputName(e.target.value)}
+            />
+            
+            <button
+                onClick={() => onSetPlayerName(inputName.trim())}
+                disabled={!isReady}
+                className={`w-full mt-6 py-3 rounded-full font-bold text-lg transition-all duration-300 
+                    ${isReady 
+                        ? 'bg-yellow-500 text-slate-900 shadow-lg hover:bg-yellow-400' 
+                        : 'bg-slate-700 text-slate-500 cursor-not-allowed'
+                    }
+                `}
+            >
+                Continue to Lobby
+            </button>
+            {!isReady && (
+                <p className="mt-4 text-center text-sm text-red-400">
+                    Please enter your name.
+                </p>
+            )}
+        </div>
+    );
+};
+
+// --- Game Lobby Screen ---
+const GameLobby = ({ userId, playerName, db, onGameJoined, currentDocId, gameData, resetGame }) => {
+    const [joinId, setJoinId] = useState('');
+    const [status, setStatus] = useState('');
+    const [loading, setLoading] = useState(false);
+    const [openGames, setOpenGames] = useState([]); 
+
+    const gameCollectionPath = `/artifacts/${appId}/public/data/ultimate_tictactoe`;
+
+    // Real-time listener for open games
+    useEffect(() => {
+        if (!db) return;
+
+        const q = query(
+            collection(db, gameCollectionPath),
+            where('players.O', '==', null),
+            limit(10)
+        );
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const games = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            })).filter(game => game.players.X.id !== userId); 
+            setOpenGames(games);
+        }, (error) => {
+            console.error("Error listening to open games:", error);
+        });
+
+        return () => unsubscribe(); 
+    }, [db, userId]);
+
+
+    // 1. Create Game (FIXED: Serializing nested array)
+    const handleCreateGame = async () => {
+        if (loading || !db) return;
+        setLoading(true);
+        setStatus('Creating game...');
+        try {
+            const newDocRef = doc(collection(db, gameCollectionPath));
+            const newGameId = newDocRef.id;
+
+            // Initialize the board as a nested array (for local state)
+            const initialBoard = Array(9).fill().map(() => Array(9).fill(null));
+
+            const initialGameData = {
+                id: newGameId,
+                board: initialBoard, // Local state uses the nested array
+                miniBoardWinners: Array(9).fill(null),
+                xIsNext: true,
+                nextBoardIndex: 9,
+                players: {
+                    X: { id: userId, name: playerName },
+                    O: null,
+                },
+                status: 'Waiting for Player O',
+            };
+            
+            // Write to Firestore: Stringify the board array to avoid nested array error
+            await setDoc(newDocRef, {
+                ...initialGameData,
+                board: JSON.stringify(initialBoard), // Firestore only sees a string
+            });
+
+            onGameJoined(newGameId, initialGameData, true);
+            setStatus('Game created! Waiting for a friend to join...');
+        } catch (error) {
+            console.error("Error creating game:", error);
+            // Display the specific error message to the user
+            setStatus(`Creation failed: ${error.message || 'Unknown Firestore error.'}`);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    // 2. Join Game Logic 
+    const joinGameLogic = async (gameId) => {
+        const trimmedGameId = gameId.trim();
+        if (loading || !trimmedGameId || !db) return;
+        setLoading(true);
+        setStatus('Joining game...');
+        
+        try {
+            const gameRef = doc(db, gameCollectionPath, trimmedGameId);
+            const docSnap = await getDoc(gameRef);
+
+            if (!docSnap.exists()) {
+                setStatus(`Game ID "${trimmedGameId}" not found. It may have been cancelled or the ID is incorrect.`);
+                setLoading(false);
+                return;
+            }
+
+            const existingData = docSnap.data();
+
+            if (existingData.players.O) {
+                setStatus('Game is already full or has been taken.');
+                setLoading(false);
+                return;
+            }
+            
+            if (existingData.players.X.id === userId) {
+                 setStatus('You cannot join a game you created. Try joining a different game.');
+                setLoading(false);
+                return;
+            }
+
+            // Assign Player O
+            await updateDoc(gameRef, {
+                'players.O': { id: userId, name: playerName },
+                status: 'In Progress',
+            });
+            
+            // The onSnapshot listener will pick up the change and handle parsing
+            onGameJoined(trimmedGameId, existingData, false); 
+        } catch (error) {
+            console.error("Error joining game:", error);
+            setStatus('Error joining game. See console for details.');
+        } finally {
+            setLoading(false);
+        }
+    }
+
+
+    // If gameData exists (we are waiting in a game we created)
+    if (currentDocId && gameData) {
+        const isGameFilled = gameData.players.O !== null;
+
+        return (
+            <div className="p-6 bg-slate-800 rounded-xl shadow-2xl border border-slate-700 w-full max-w-md mx-auto text-white">
+                <h2 className="text-3xl font-extrabold text-white mb-6 text-center">
+                    {isGameFilled ? "Opponent Joined!" : "Waiting for Opponent..."}
+                </h2>
+                <div className="text-center mb-6">
+                    <p className="text-xl font-bold text-yellow-400 mb-2">Share this Game ID:</p>
+                    <div className="flex items-center justify-center bg-slate-700 p-3 rounded-lg border-2 border-yellow-500/50">
+                        <span className="font-mono text-2xl tracking-wider select-all">{currentDocId}</span>
+                        <button 
+                            className="ml-4 text-white hover:text-yellow-400 transition"
+                            onClick={() => {
+                                const el = document.createElement('textarea');
+                                el.value = currentDocId;
+                                document.body.appendChild(el);
+                                el.select();
+                                document.execCommand('copy');
+                                document.body.removeChild(el);
+                                setStatus('ID Copied!');
+                                setTimeout(() => setStatus(''), 2000);
+                            }}
+                        >
+                            <Link size={20} />
+                        </button>
+                    </div>
+                </div>
+                
+                <div className="mb-4">
+                    <p className="text-lg font-bold text-cyan-400">Player X (Host):</p>
+                    <p className="ml-4">{gameData.players.X.name}</p>
+                </div>
+                <div className="mb-6">
+                    <p className="text-lg font-bold text-pink-400">Player O:</p>
+                    <p className="ml-4">{isGameFilled ? gameData.players.O.name : <span className="text-slate-400 italic">...Waiting...</span>}</p>
+                </div>
+
+                <div className="text-center min-h-[20px] mb-2">
+                    <p className={`text-sm flex items-center justify-center ${status.includes('failed') || status.includes('not found') || status.includes('full') ? 'text-red-400' : 'text-green-400'}`}>
+                        {(status.includes('failed') || status.includes('not found') || status.includes('full')) && <AlertTriangle size={16} className="mr-1" />}
+                        {status}
+                    </p>
+                </div>
+                
+                <button
+                    onClick={resetGame}
+                    className="w-full mt-4 py-2 bg-slate-600 text-white rounded-full font-bold hover:bg-slate-500 transition-colors"
+                >
+                    Cancel Game / Return to Lobby
+                </button>
+            </div>
+        );
+    }
+
+    // Initial Lobby view
+    return (
+        <div className="p-6 bg-slate-800 rounded-xl shadow-2xl border border-slate-700 w-full max-w-sm mx-auto text-white">
+            <h2 className="text-3xl font-extrabold text-white mb-6 text-center">
+                Game Lobby
+            </h2>
+            <p className="text-center text-md mb-6">Welcome, <span className="text-yellow-400 font-bold">{playerName}</span>!</p>
+
+            <button
+                onClick={handleCreateGame}
+                // Check that DB is ready before enabling create game
+                disabled={loading || !db} 
+                className="w-full mb-4 py-3 rounded-full font-bold text-lg transition-all duration-300 bg-cyan-500 text-slate-900 shadow-lg hover:bg-cyan-400 disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed flex items-center justify-center"
+            >
+                {loading && !joinId ? <Loader2 size={20} className="animate-spin mr-2" /> : <Gamepad2 size={20} className="mr-2" />}
+                Create New Game (Be Player X)
+            </button>
+
+            {/* Status Message for Errors/Info */}
+            <div className="text-center min-h-[20px] mb-4">
+                <p className={`text-sm flex items-center justify-center ${status.includes('failed') || status.includes('not found') || status.includes('full') || status.includes('Error') ? 'text-red-400' : 'text-green-400'}`}>
+                    {(status.includes('failed') || status.includes('not found') || status.includes('full')) && <AlertTriangle size={16} className="mr-1" />}
+                    {status}
+                </p>
+            </div>
+            
+            {/* --- Open Games List --- */}
+            <h3 className="text-xl font-bold mb-3 flex items-center text-yellow-400">
+                <Users size={20} className="mr-2"/> Open Games ({openGames.length})
+            </h3>
+            
+            {openGames.length > 0 ? (
+                <div className="space-y-2 max-h-48 overflow-y-auto pr-2">
+                    {openGames.map(game => (
+                        <div key={game.id} className="flex justify-between items-center p-3 bg-slate-700 rounded-lg shadow-md">
+                            <span className="text-slate-200 font-medium truncate">
+                                Game by: <span className="text-cyan-400">{game.players.X.name}</span>
+                            </span>
+                            <button
+                                onClick={() => joinGameLogic(game.id)}
+                                disabled={loading || !db}
+                                className="px-3 py-1 bg-pink-500 text-slate-900 text-sm font-bold rounded-full hover:bg-pink-400 transition-colors disabled:opacity-60"
+                            >
+                                Join (O)
+                            </button>
+                        </div>
+                    ))}
+                </div>
+            ) : (
+                <p className="text-center text-slate-400 italic">No games are currently waiting. Create one!</p>
+            )}
+
+            {/* --- Manual Join (Emphasized) */}
+            <div className="flex items-center my-4">
+                <div className="flex-grow border-t border-slate-700"></div>
+                <span className="flex-shrink mx-4 text-slate-500 font-bold">OR JOIN WITH ID</span>
+                <div className="flex-grow border-t border-slate-700"></div>
+            </div>
+
+            <h3 className="text-xl font-bold mb-3 text-white">Manual Join:</h3>
+            <input
+                type="text"
+                value={joinId}
+                onChange={(e) => setJoinId(e.target.value.trim())}
+                placeholder="Enter 20-character Game ID"
+                className="w-full p-3 mb-4 bg-slate-700/80 border-2 border-slate-600 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-red-500 outline-none"
+            />
+            
+            <button
+                onClick={() => joinGameLogic(joinId)}
+                disabled={loading || !joinId || !db}
+                className="w-full py-3 rounded-full font-bold text-lg transition-all duration-300 bg-red-500 text-slate-900 shadow-lg hover:bg-red-400 disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed flex items-center justify-center"
+            >
+                {loading && joinId ? <Loader2 size={20} className="animate-spin mr-2" /> : <Users size={20} className="mr-2" />}
+                Join Game Manually
+            </button>
+        </div>
+    );
+};
+
+
+// --- Main App Component ---
+const App = () => {
+    // --- FIREBASE AND USER STATE ---
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState('');
+    const [isAuthReady, setIsAuthReady] = useState(false);
+
+    // --- GAME STATE ---
+    const [gameData, setGameData] = useState(null);
+    const [playerName, setPlayerName] = useState('');
+    const [currentDocId, setCurrentDocId] = useState(null);
+    const [isHost, setIsHost] = useState(false); 
+
+    // --- GAME DATA DESTRUCTURING (for ease of use) ---
+    // The board will be initialized as null here, then populated by the listener
+    const board = gameData?.board || Array(9).fill().map(() => Array(9).fill(null));
+    const miniBoardWinners = gameData?.miniBoardWinners || Array(9).fill(null);
+    const xIsNext = gameData?.xIsNext ?? true;
+    const nextBoardIndex = gameData?.nextBoardIndex ?? 9;
+    const players = gameData?.players || { X: null, O: null };
+    const gameStatus = gameData?.status || 'Lobby';
+
+    // Derived States
+    const userMarker = players.X?.id === userId ? 'X' : players.O?.id === userId ? 'O' : null;
+    const playerXName = players.X?.name || 'Player X';
+    const playerOName = players.O?.name || 'Player O';
+    
+    const winInfo = useMemo(() => calculateWinner(miniBoardWinners), [miniBoardWinners]);
+    const overallWinner = winInfo ? winInfo.winner : null;
+    const isDraw = !overallWinner && miniBoardWinners.every(b => b !== null);
+    const isYourTurn = !overallWinner && userMarker === (xIsNext ? 'X' : 'O') && gameStatus === 'In Progress';
+    const waitingForOpponent = !players.X || !players.O;
+    const gameCollectionPath = `/artifacts/${appId}/public/data/ultimate_tictactoe`;
+
+    // 1. FIREBASE INITIALIZATION AND AUTHENTICATION
+    useEffect(() => {
+        if (!firebaseConfig) return;
+
+        try {
+            setLogLevel('Debug');
+            
+            const app = initializeApp(firebaseConfig);
+            const firestore = getFirestore(app);
+            const authentication = getAuth(app);
+            setDb(firestore);
+            setAuth(authentication);
+
+            const handleSignIn = async () => {
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(authentication, initialAuthToken);
+                    } else {
+                        await signInAnonymously(authentication);
+                    }
+                } catch (error) {
+                    console.error("Firebase Auth Error:", error);
+                }
+            };
+
+            onAuthStateChanged(authentication, (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                } else {
+                    handleSignIn();
+                }
+                setIsAuthReady(true);
+            });
+        } catch (e) {
+            console.error("Firebase Init Error:", e);
+        }
+    }, []);
+
+    // 2. FIRESTORE REAL-TIME LISTENER (Parsing stringified board)
+    useEffect(() => {
+        if (!db || !currentDocId) return;
+
+        const docRef = doc(db, gameCollectionPath, currentDocId);
+        
+        const unsubscribe = onSnapshot(docRef, (docSnap) => {
+            if (docSnap.exists()) {
+                const data = docSnap.data();
+                
+                // IMPORTANT: Parse the board array back from a string
+                if (typeof data.board === 'string') {
+                    try {
+                        data.board = JSON.parse(data.board);
+                    } catch (e) {
+                        console.error("Error parsing board data:", e);
+                        return; // Stop update if parsing fails
+                    }
+                }
+
+                setGameData(data);
+            } else {
+                handleResetGame();
+                console.log("Game document deleted. Resetting.");
+            }
+        }, (error) => {
+            console.error("Firestore Snapshot Error:", error);
+        });
+
+        return () => unsubscribe();
+    }, [db, currentDocId]);
+
+    // HANDLER FUNCTIONS
+
+    const handleGameJoined = (gameId, initialData, hostStatus) => {
+        setCurrentDocId(gameId);
+        setGameData(initialData);
+        setIsHost(hostStatus);
+    };
+
+    const handleResetGame = () => {
+        setGameData(null);
+        setCurrentDocId(null);
+        setIsHost(false);
+    };
+
+    // 3. HANDLE GAME MOVE (Now using runTransaction for concurrency control)
+    const handleClick = useCallback(async (boardIdx, squareIdx) => {
+        // Initial client-side checks for faster feedback (but validation happens again in transaction)
+        if (!db || !gameData || !currentDocId || !isYourTurn || overallWinner || isDraw || waitingForOpponent) {
+            console.log("Move prevented: Not your turn, game over, or not ready.");
+            return;
+        }
+
+        const player = userMarker;
+
+        if (nextBoardIndex !== 9 && nextBoardIndex !== boardIdx) return;
+
+        const gameRef = doc(db, gameCollectionPath, currentDocId);
+
+        try {
+            await runTransaction(db, async (transaction) => {
+                const gameDoc = await transaction.get(gameRef);
+                if (!gameDoc.exists()) throw new Error("Game document missing");
+
+                const data = gameDoc.data();
+                // Safely parse the stringified board array from the database
+                const boardFromDb = typeof data.board === 'string' ? JSON.parse(data.board) : data.board;
+                const miniBoardWinnersFromDb = data.miniBoardWinners || Array(9).fill(null);
+                const xIsNextFromDb = data.xIsNext ?? true;
+                const nextBoardIndexFromDb = data.nextBoardIndex ?? 9;
+
+                // Validate move again inside transaction using fresh data
+                if ((xIsNextFromDb ? 'X' : 'O') !== player) throw new Error("Not your turn");
+                if (miniBoardWinnersFromDb[boardIdx] || boardFromDb[boardIdx][squareIdx]) return;
+
+                const newBoard = boardFromDb.map(mini => [...mini]);
+                newBoard[boardIdx][squareIdx] = player;
+
+                const newMiniBoardWinners = [...miniBoardWinnersFromDb];
+                let newNextBoardIndex = squareIdx;
+
+                const miniWinInfo = calculateWinner(newBoard[boardIdx]);
+                if (miniWinInfo && !newMiniBoardWinners[boardIdx]) newMiniBoardWinners[boardIdx] = player;
+                else if (isBoardFull(newBoard[boardIdx]) && !newMiniBoardWinners[boardIdx]) newMiniBoardWinners[boardIdx] = 'TIE';
+
+                // Check if the next required board is already won/tied
+                if (newMiniBoardWinners[newNextBoardIndex]) newNextBoardIndex = 9;
+
+                // Commit the update (Crucially, board is stringified again)
+                transaction.update(gameRef, {
+                    board: JSON.stringify(newBoard),
+                    miniBoardWinners: newMiniBoardWinners,
+                    xIsNext: !xIsNextFromDb,
+                    nextBoardIndex: newNextBoardIndex,
+                });
+            });
+            console.log("Move successfully committed via transaction.");
+        } catch (error) {
+            console.error("Transaction move error:", error);
+            // Optionally set a user-facing error message here based on the error
+        }
+    }, [db, gameData, currentDocId, isYourTurn, overallWinner, isDraw, waitingForOpponent, userMarker, nextBoardIndex, gameCollectionPath]);
+
+
+    // RENDER LOGIC
+    
+    let content;
+
+    if (!isAuthReady || !db) {
+        content = (
+            <div className="flex flex-col items-center justify-center p-8 bg-slate-800 rounded-xl shadow-2xl">
+                <Loader2 size={32} className="text-yellow-400 animate-spin mb-4" />
+                <p className="text-xl text-white">Connecting to Service...</p>
+            </div>
+        );
+    } else if (!playerName) {
+        content = <NameInputScreen onSetPlayerName={setPlayerName} />;
+    } else if (!currentDocId || gameStatus === 'Lobby') {
+        content = (
+            <GameLobby 
+                userId={userId} 
+                playerName={playerName} 
+                db={db} 
+                onGameJoined={handleGameJoined}
+                currentDocId={currentDocId}
+                gameData={gameData}
+                resetGame={handleResetGame}
+            />
+        );
+    } else {
+        // --- IN-GAME VIEW ---
+
+        let status;
+        let gameActive = !overallWinner && !isDraw;
+        
+        if (overallWinner) {
+            const winnerName = overallWinner === 'X' ? playerXName : playerOName;
+            const winnerColor = overallWinner === 'X' ? 'text-green-400' : 'text-red-400';
+            status = (
+                <div className={`flex items-center font-bold text-3xl ${winnerColor}`}>
+                    {winnerName} Wins the Game!
+                </div>
+            );
+        } else if (isDraw) {
+            status = <div className="text-yellow-400 font-bold text-3xl">Ultimate Draw!</div>;
+        } else if (waitingForOpponent) {
+            status = <div className="text-yellow-400 font-bold text-2xl">Waiting for Player O to join...</div>;
+        } else {
+            const currentPlayerName = xIsNext ? playerXName : playerOName;
+            const currentPlayerMarker = xIsNext ? 'X' : 'O';
+            const markerColorClass = xIsNext ? 'text-cyan-400' : 'text-pink-400';
+            
+            status = (
+                <div className="flex items-center text-white text-2xl">
+                    <span className="mr-3 font-light">
+                        {isYourTurn ? "Your Turn" : `${currentPlayerName}'s Turn`}
+                    </span>
+                    <span className={`font-bold ${markerColorClass}`}>
+                        ({currentPlayerMarker})
+                    </span>
+                </div>
+            );
+        }
+        
+        const requiredBoardMessage = nextBoardIndex === 9 
+            ? "Any open board." 
+            : `Board ${nextBoardIndex + 1}`;
+
+        content = (
+            <div className="w-full max-w-xl">
+                
+                {/* Game ID & Your ID (Separated and clearly labeled) */}
+                <div className="text-center text-sm mb-4 p-2 rounded-lg bg-slate-800/70 border border-slate-700">
+                    <p className="font-mono text-xl text-yellow-400 font-extrabold mb-1 flex items-center justify-center">
+                        <Shield size={20} className="mr-2"/> GAME ID: <span className="text-white ml-2">{currentDocId}</span>
+                    </p>
+                    <p className="font-mono text-xs text-slate-500">
+                        (Your personal User ID: <span className="select-all">{userId}</span>)
+                    </p>
+                </div>
+
+                {/* Player Legend */}
+                <div className="flex justify-center space-x-8 text-xl mb-6 p-2 bg-slate-800/70 rounded-lg border border-slate-700">
+                    <div className="flex items-center text-cyan-400 font-bold">
+                        <X size={24} className="mr-2" /> {playerXName} (X)
+                        {userMarker === 'X' && <span className="text-yellow-400 text-sm ml-2">(You)</span>}
+                    </div>
+                    <div className="flex items-center text-pink-400 font-bold">
+                        <Circle size={22} className="mr-2" /> {playerOName} (O)
+                        {userMarker === 'O' && <span className="text-yellow-400 text-sm ml-2">(You)</span>}
+                    </div>
+                </div>
+
+                {/* Status Bar */}
+                <div className="mb-6 p-4 bg-slate-800 rounded-xl shadow-2xl border border-slate-700">
+                    <div className="min-h-[40px] flex justify-center items-center mb-3">
+                        {status}
+                    </div>
+                    
+                    {gameActive && !waitingForOpponent && (
+                        <p className="text-lg text-yellow-300 text-center font-medium mb-4">
+                            Forced Move: <span className="text-white">{requiredBoardMessage}</span>
+                        </p>
+                    )}
+
+                    {/* Exit/Reset Button */}
+                    <div className="flex justify-center">
+                        <button
+                            onClick={handleResetGame}
+                            className="flex items-center px-6 py-2 bg-slate-600 text-white rounded-full font-bold shadow-md hover:bg-slate-500 transition-colors duration-200"
+                        >
+                            <RefreshCcw size={18} className="mr-2" />
+                            {overallWinner || isDraw ? 'Start New Game' : 'Return to Lobby'}
+                        </button>
+                    </div>
+                </div>
+
+                {/* Game Board */}
+                <div className="grid grid-cols-3 gap-3 aspect-square bg-slate-900/50 p-3 rounded-xl shadow-2xl border-4 border-slate-700">
+                    {board.map((miniBoardSquares, i) => (
+                        <MiniBoard
+                            key={i}
+                            boardId={i}
+                            squares={miniBoardSquares}
+                            winner={miniBoardWinners[i]}
+                            isNextBoard={isYourTurn && (nextBoardIndex === i || nextBoardIndex === 9)}
+                            overallWinner={overallWinner}
+                            onSquareClick={handleClick}
+                        />
+                    ))}
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-start py-8 px-4">
+            <h1 className="text-4xl font-extrabold text-white mb-8 text-center tracking-wider">
+                ULTIMATE TIC TAC TOE
+            </h1>
+            {content}
+            <div className="mt-8 text-sm text-slate-400 bg-slate-800/50 p-4 rounded-lg w-full max-w-xl">
+                <h3 className="text-base font-bold text-white mb-2">Multiplayer Tip:</h3>
+                <p className="space-y-1">
+                    The move logic now uses a **Firestore Transaction (`runTransaction`)**. This is a powerful, production-ready technique that ensures all game logic and updates are atomic, preventing any race conditions when both players try to make a move simultaneously!
+                </p>
+            </div>
+        </div>
+    );
+};
+
+export default App;
+
+import React, { useState, useMemo, useCallback, useEffect } from 'react';
+import { RefreshCcw, X, Circle, Link, Gamepad2, Users, Loader2, AlertTriangle, Shield } from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { 
+    getFirestore, doc, onSnapshot, setDoc, updateDoc, getDoc, 
+    collection, query, where, getDocs, limit, setLogLevel, runTransaction
+} from 'firebase/firestore';
+
+// --- GLOBAL VARIABLES (Provided by the environment) ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// --- GAME LOGIC FUNCTIONS ---
+
+/**
+ * Checks for a winner across 9 elements.
+ */
+function calculateWinner(squares) {
+    const lines = [
+        [0, 1, 2], [3, 4, 5], [6, 7, 8], // Rows
+        [0, 3, 6], [1, 4, 7], [2, 5, 8], // Columns
+        [0, 4, 8], [2, 4, 6],           // Diagonals
+    ];
+    for (let i = 0; i < lines.length; i++) {
+        const [a, b, c] = lines[i];
+        if (squares[a] && squares[a] === squares[b] && squares[a] === squares[c]) {
+            return { winner: squares[a], line: lines[i] };
+        }
+    }
+    return null;
+}
+
+/**
+ * Checks if a board is completely full.
+ */
+function isBoardFull(squares) {
+    return squares.every(Boolean);
+}
+
+// --- REACT COMPONENTS (Square, MiniBoard, InputField) ---
+
+const Square = React.memo(({ value, onClick, disabled }) => {
+    let textColor = value === 'X' ? 'text-cyan-400' : 'text-pink-400';
+    
+    return (
+        <button
+            className={`
+                w-full h-full text-2xl font-bold p-1
+                bg-slate-800/50 rounded-md shadow-md 
+                flex items-center justify-center transition-all duration-150
+                ${disabled ? 'cursor-not-allowed opacity-50' : 'hover:bg-slate-700/70'}
+            `}
+            onClick={onClick}
+            disabled={value !== null || disabled}
+        >
+            {value === 'X' && <X size={28} className={textColor} />}
+            {value === 'O' && <Circle size={25} className={textColor} />}
+        </button>
+    );
+});
+
+const MiniBoard = React.memo(({ boardId, squares, winner, isNextBoard, overallWinner, onSquareClick }) => {
+    
+    let boardClass = 'bg-slate-700 p-2 rounded-lg shadow-inner transition-all duration-300 relative';
+    
+    if (overallWinner) {
+        boardClass += ' opacity-70';
+    } else if (winner) {
+        boardClass += ` shadow-2xl ${winner === 'X' ? 'border-4 border-cyan-400' : 'border-4 border-pink-400'}`;
+    } else if (isNextBoard) {
+        boardClass += ' shadow-2xl ring-4 ring-offset-1 ring-offset-slate-900 ring-yellow-500/80 scale-[1.02]';
+    } else {
+        boardClass += ' opacity-80';
+    }
+
+    return (
+        <div className={boardClass}>
+            {winner ? (
+                <div className="absolute inset-0 flex items-center justify-center bg-slate-900/80 rounded-lg">
+                    {winner === 'X' ? 
+                        <X size={80} className="text-cyan-400 opacity-60" /> : 
+                        <Circle size={75} className="text-pink-400 opacity-60" />
+                    }
+                </div>
+            ) : (
+                <div className="grid grid-cols-3 gap-1 aspect-square">
+                    {squares.map((value, i) => (
+                        <Square 
+                            key={i} 
+                            value={value} 
+                            onClick={() => onSquareClick(boardId, i)}
+                            disabled={overallWinner || (!isNextBoard && boardId !== 9)}
+                        />
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+});
+
+const InputField = React.memo(({ player, label, color, value, onChange }) => (
+    <div className="mb-4">
+        <label className={`block text-lg font-medium ${color} mb-2`}>
+            {label}
+        </label>
+        <input
+            key={`input-${player}`} 
+            type="text"
+            value={value}
+            onChange={onChange}
+            placeholder={`Enter name for Player ${player}`}
+            maxLength={15}
+            className="w-full p-3 bg-slate-700/80 border border-slate-600 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-yellow-500 focus:border-yellow-500 outline-none transition-colors"
+        />
+    </div>
+));
+
+
+const NameInputScreen = ({ onSetPlayerName }) => { 
+    const [inputName, setInputName] = useState(''); 
+    const isReady = inputName.trim().length > 0;
+
+    return (
+        <div className="p-6 bg-slate-800 rounded-xl shadow-2xl border border-slate-700 w-full max-w-sm mx-auto">
+            <h2 className="text-3xl font-extrabold text-white mb-6 text-center">
+                Enter Your Player Name
+            </h2>
+            
+            <InputField 
+                player="self" 
+                label="Your Name" 
+                color="text-yellow-400" 
+                value={inputName}
+                onChange={(e) => setInputName(e.target.value)}
+            />
+            
+            <button
+                onClick={() => onSetPlayerName(inputName.trim())}
+                disabled={!isReady}
+                className={`w-full mt-6 py-3 rounded-full font-bold text-lg transition-all duration-300 
+                    ${isReady 
+                        ? 'bg-yellow-500 text-slate-900 shadow-lg hover:bg-yellow-400' 
+                        : 'bg-slate-700 text-slate-500 cursor-not-allowed'
+                    }
+                `}
+            >
+                Continue to Lobby
+            </button>
+            {!isReady && (
+                <p className="mt-4 text-center text-sm text-red-400">
+                    Please enter your name.
+                </p>
+            )}
+        </div>
+    );
+};
+
+// --- Game Lobby Screen ---
+const GameLobby = ({ userId, playerName, db, onGameJoined, currentDocId, gameData, resetGame }) => {
+    const [joinId, setJoinId] = useState('');
+    const [status, setStatus] = useState('');
+    const [loading, setLoading] = useState(false);
+    const [openGames, setOpenGames] = useState([]); 
+
+    const gameCollectionPath = `/artifacts/${appId}/public/data/ultimate_tictactoe`;
+
+    // Real-time listener for open games
+    useEffect(() => {
+        if (!db) return;
+
+        const q = query(
+            collection(db, gameCollectionPath),
+            where('players.O', '==', null),
+            limit(10)
+        );
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const games = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            })).filter(game => game.players.X.id !== userId); 
+            setOpenGames(games);
+        }, (error) => {
+            console.error("Error listening to open games:", error);
+        });
+
+        return () => unsubscribe(); 
+    }, [db, userId]);
+
+
+    // 1. Create Game (FIXED: Serializing nested array)
+    const handleCreateGame = async () => {
+        if (loading || !db) return;
+        setLoading(true);
+        setStatus('Creating game...');
+        try {
+            const newDocRef = doc(collection(db, gameCollectionPath));
+            const newGameId = newDocRef.id;
+
+            // Initialize the board as a nested array (for local state)
+            const initialBoard = Array(9).fill().map(() => Array(9).fill(null));
+
+            const initialGameData = {
+                id: newGameId,
+                board: initialBoard, // Local state uses the nested array
+                miniBoardWinners: Array(9).fill(null),
+                xIsNext: true,
+                nextBoardIndex: 9,
+                players: {
+                    X: { id: userId, name: playerName },
+                    O: null,
+                },
+                status: 'Waiting for Player O',
+            };
+            
+            // Write to Firestore: Stringify the board array to avoid nested array error
+            await setDoc(newDocRef, {
+                ...initialGameData,
+                board: JSON.stringify(initialBoard), // Firestore only sees a string
+            });
+
+            onGameJoined(newGameId, initialGameData, true);
+            setStatus('Game created! Waiting for a friend to join...');
+        } catch (error) {
+            console.error("Error creating game:", error);
+            // Display the specific error message to the user
+            setStatus(`Creation failed: ${error.message || 'Unknown Firestore error.'}`);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    // 2. Join Game Logic 
+    const joinGameLogic = async (gameId) => {
+        const trimmedGameId = gameId.trim();
+        if (loading || !trimmedGameId || !db) return;
+        setLoading(true);
+        setStatus('Joining game...');
+        
+        try {
+            const gameRef = doc(db, gameCollectionPath, trimmedGameId);
+            const docSnap = await getDoc(gameRef);
+
+            if (!docSnap.exists()) {
+                setStatus(`Game ID "${trimmedGameId}" not found. It may have been cancelled or the ID is incorrect.`);
+                setLoading(false);
+                return;
+            }
+
+            const existingData = docSnap.data();
+
+            if (existingData.players.O) {
+                setStatus('Game is already full or has been taken.');
+                setLoading(false);
+                return;
+            }
+            
+            if (existingData.players.X.id === userId) {
+                 setStatus('You cannot join a game you created. Try joining a different game.');
+                setLoading(false);
+                return;
+            }
+
+            // Assign Player O
+            await updateDoc(gameRef, {
+                'players.O': { id: userId, name: playerName },
+                status: 'In Progress',
+            });
+            
+            // The onSnapshot listener will pick up the change and handle parsing
+            onGameJoined(trimmedGameId, existingData, false); 
+        } catch (error) {
+            console.error("Error joining game:", error);
+            setStatus('Error joining game. See console for details.');
+        } finally {
+            setLoading(false);
+        }
+    }
+
+
+    // If gameData exists (we are waiting in a game we created)
+    if (currentDocId && gameData) {
+        const isGameFilled = gameData.players.O !== null;
+
+        return (
+            <div className="p-6 bg-slate-800 rounded-xl shadow-2xl border border-slate-700 w-full max-w-md mx-auto text-white">
+                <h2 className="text-3xl font-extrabold text-white mb-6 text-center">
+                    {isGameFilled ? "Opponent Joined!" : "Waiting for Opponent..."}
+                </h2>
+                <div className="text-center mb-6">
+                    <p className="text-xl font-bold text-yellow-400 mb-2">Share this Game ID:</p>
+                    <div className="flex items-center justify-center bg-slate-700 p-3 rounded-lg border-2 border-yellow-500/50">
+                        <span className="font-mono text-2xl tracking-wider select-all">{currentDocId}</span>
+                        <button 
+                            className="ml-4 text-white hover:text-yellow-400 transition"
+                            onClick={() => {
+                                const el = document.createElement('textarea');
+                                el.value = currentDocId;
+                                document.body.appendChild(el);
+                                el.select();
+                                document.execCommand('copy');
+                                document.body.removeChild(el);
+                                setStatus('ID Copied!');
+                                setTimeout(() => setStatus(''), 2000);
+                            }}
+                        >
+                            <Link size={20} />
+                        </button>
+                    </div>
+                </div>
+                
+                <div className="mb-4">
+                    <p className="text-lg font-bold text-cyan-400">Player X (Host):</p>
+                    <p className="ml-4">{gameData.players.X.name}</p>
+                </div>
+                <div className="mb-6">
+                    <p className="text-lg font-bold text-pink-400">Player O:</p>
+                    <p className="ml-4">{isGameFilled ? gameData.players.O.name : <span className="text-slate-400 italic">...Waiting...</span>}</p>
+                </div>
+
+                <div className="text-center min-h-[20px] mb-2">
+                    <p className={`text-sm flex items-center justify-center ${status.includes('failed') || status.includes('not found') || status.includes('full') ? 'text-red-400' : 'text-green-400'}`}>
+                        {(status.includes('failed') || status.includes('not found') || status.includes('full')) && <AlertTriangle size={16} className="mr-1" />}
+                        {status}
+                    </p>
+                </div>
+                
+                <button
+                    onClick={resetGame}
+                    className="w-full mt-4 py-2 bg-slate-600 text-white rounded-full font-bold hover:bg-slate-500 transition-colors"
+                >
+                    Cancel Game / Return to Lobby
+                </button>
+            </div>
+        );
+    }
+
+    // Initial Lobby view
+    return (
+        <div className="p-6 bg-slate-800 rounded-xl shadow-2xl border border-slate-700 w-full max-w-sm mx-auto text-white">
+            <h2 className="text-3xl font-extrabold text-white mb-6 text-center">
+                Game Lobby
+            </h2>
+            <p className="text-center text-md mb-6">Welcome, <span className="text-yellow-400 font-bold">{playerName}</span>!</p>
+
+            <button
+                onClick={handleCreateGame}
+                // Check that DB is ready before enabling create game
+                disabled={loading || !db} 
+                className="w-full mb-4 py-3 rounded-full font-bold text-lg transition-all duration-300 bg-cyan-500 text-slate-900 shadow-lg hover:bg-cyan-400 disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed flex items-center justify-center"
+            >
+                {loading && !joinId ? <Loader2 size={20} className="animate-spin mr-2" /> : <Gamepad2 size={20} className="mr-2" />}
+                Create New Game (Be Player X)
+            </button>
+
+            {/* Status Message for Errors/Info */}
+            <div className="text-center min-h-[20px] mb-4">
+                <p className={`text-sm flex items-center justify-center ${status.includes('failed') || status.includes('not found') || status.includes('full') || status.includes('Error') ? 'text-red-400' : 'text-green-400'}`}>
+                    {(status.includes('failed') || status.includes('not found') || status.includes('full')) && <AlertTriangle size={16} className="mr-1" />}
+                    {status}
+                </p>
+            </div>
+            
+            {/* --- Open Games List --- */}
+            <h3 className="text-xl font-bold mb-3 flex items-center text-yellow-400">
+                <Users size={20} className="mr-2"/> Open Games ({openGames.length})
+            </h3>
+            
+            {openGames.length > 0 ? (
+                <div className="space-y-2 max-h-48 overflow-y-auto pr-2">
+                    {openGames.map(game => (
+                        <div key={game.id} className="flex justify-between items-center p-3 bg-slate-700 rounded-lg shadow-md">
+                            <span className="text-slate-200 font-medium truncate">
+                                Game by: <span className="text-cyan-400">{game.players.X.name}</span>
+                            </span>
+                            <button
+                                onClick={() => joinGameLogic(game.id)}
+                                disabled={loading || !db}
+                                className="px-3 py-1 bg-pink-500 text-slate-900 text-sm font-bold rounded-full hover:bg-pink-400 transition-colors disabled:opacity-60"
+                            >
+                                Join (O)
+                            </button>
+                        </div>
+                    ))}
+                </div>
+            ) : (
+                <p className="text-center text-slate-400 italic">No games are currently waiting. Create one!</p>
+            )}
+
+            {/* --- Manual Join (Emphasized) */}
+            <div className="flex items-center my-4">
+                <div className="flex-grow border-t border-slate-700"></div>
+                <span className="flex-shrink mx-4 text-slate-500 font-bold">OR JOIN WITH ID</span>
+                <div className="flex-grow border-t border-slate-700"></div>
+            </div>
+
+            <h3 className="text-xl font-bold mb-3 text-white">Manual Join:</h3>
+            <input
+                type="text"
+                value={joinId}
+                onChange={(e) => setJoinId(e.target.value.trim())}
+                placeholder="Enter 20-character Game ID"
+                className="w-full p-3 mb-4 bg-slate-700/80 border-2 border-slate-600 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-red-500 outline-none"
+            />
+            
+            <button
+                onClick={() => joinGameLogic(joinId)}
+                disabled={loading || !joinId || !db}
+                className="w-full py-3 rounded-full font-bold text-lg transition-all duration-300 bg-red-500 text-slate-900 shadow-lg hover:bg-red-400 disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed flex items-center justify-center"
+            >
+                {loading && joinId ? <Loader2 size={20} className="animate-spin mr-2" /> : <Users size={20} className="mr-2" />}
+                Join Game Manually
+            </button>
+        </div>
+    );
+};
+
+
+// --- Main App Component ---
+const App = () => {
+    // --- FIREBASE AND USER STATE ---
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState('');
+    const [isAuthReady, setIsAuthReady] = useState(false);
+
+    // --- GAME STATE ---
+    const [gameData, setGameData] = useState(null);
+    const [playerName, setPlayerName] = useState('');
+    const [currentDocId, setCurrentDocId] = useState(null);
+    const [isHost, setIsHost] = useState(false); 
+
+    // --- GAME DATA DESTRUCTURING (for ease of use) ---
+    // The board will be initialized as null here, then populated by the listener
+    const board = gameData?.board || Array(9).fill().map(() => Array(9).fill(null));
+    const miniBoardWinners = gameData?.miniBoardWinners || Array(9).fill(null);
+    const xIsNext = gameData?.xIsNext ?? true;
+    const nextBoardIndex = gameData?.nextBoardIndex ?? 9;
+    const players = gameData?.players || { X: null, O: null };
+    const gameStatus = gameData?.status || 'Lobby';
+
+    // Derived States
+    const userMarker = players.X?.id === userId ? 'X' : players.O?.id === userId ? 'O' : null;
+    const playerXName = players.X?.name || 'Player X';
+    const playerOName = players.O?.name || 'Player O';
+    
+    const winInfo = useMemo(() => calculateWinner(miniBoardWinners), [miniBoardWinners]);
+    const overallWinner = winInfo ? winInfo.winner : null;
+    const isDraw = !overallWinner && miniBoardWinners.every(b => b !== null);
+    const isYourTurn = !overallWinner && userMarker === (xIsNext ? 'X' : 'O') && gameStatus === 'In Progress';
+    const waitingForOpponent = !players.X || !players.O;
+    const gameCollectionPath = `/artifacts/${appId}/public/data/ultimate_tictactoe`;
+
+    // 1. FIREBASE INITIALIZATION AND AUTHENTICATION
+    useEffect(() => {
+        if (!firebaseConfig) return;
+
+        try {
+            setLogLevel('Debug');
+            
+            const app = initializeApp(firebaseConfig);
+            const firestore = getFirestore(app);
+            const authentication = getAuth(app);
+            setDb(firestore);
+            setAuth(authentication);
+
+            const handleSignIn = async () => {
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(authentication, initialAuthToken);
+                    } else {
+                        await signInAnonymously(authentication);
+                    }
+                } catch (error) {
+                    console.error("Firebase Auth Error:", error);
+                }
+            };
+
+            onAuthStateChanged(authentication, (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                } else {
+                    handleSignIn();
+                }
+                setIsAuthReady(true);
+            });
+        } catch (e) {
+            console.error("Firebase Init Error:", e);
+        }
+    }, []);
+
+    // 2. FIRESTORE REAL-TIME LISTENER (Parsing stringified board)
+    useEffect(() => {
+        if (!db || !currentDocId) return;
+
+        const docRef = doc(db, gameCollectionPath, currentDocId);
+        
+        const unsubscribe = onSnapshot(docRef, (docSnap) => {
+            if (docSnap.exists()) {
+                const data = docSnap.data();
+                
+                // IMPORTANT: Parse the board array back from a string
+                if (typeof data.board === 'string') {
+                    try {
+                        data.board = JSON.parse(data.board);
+                    } catch (e) {
+                        console.error("Error parsing board data:", e);
+                        return; // Stop update if parsing fails
+                    }
+                }
+
+                setGameData(data);
+            } else {
+                handleResetGame();
+                console.log("Game document deleted. Resetting.");
+            }
+        }, (error) => {
+            console.error("Firestore Snapshot Error:", error);
+        });
+
+        return () => unsubscribe();
+    }, [db, currentDocId]);
+
+    // HANDLER FUNCTIONS
+
+    const handleGameJoined = (gameId, initialData, hostStatus) => {
+        setCurrentDocId(gameId);
+        setGameData(initialData);
+        setIsHost(hostStatus);
+    };
+
+    const handleResetGame = () => {
+        setGameData(null);
+        setCurrentDocId(null);
+        setIsHost(false);
+    };
+
+    // 3. HANDLE GAME MOVE (Now using runTransaction for concurrency control)
+    const handleClick = useCallback(async (boardIdx, squareIdx) => {
+        // Initial client-side checks for faster feedback (but validation happens again in transaction)
+        if (!db || !gameData || !currentDocId || !isYourTurn || overallWinner || isDraw || waitingForOpponent) {
+            console.log("Move prevented: Not your turn, game over, or not ready.");
+            return;
+        }
+
+        const player = userMarker;
+
+        if (nextBoardIndex !== 9 && nextBoardIndex !== boardIdx) return;
+
+        const gameRef = doc(db, gameCollectionPath, currentDocId);
+
+        try {
+            await runTransaction(db, async (transaction) => {
+                const gameDoc = await transaction.get(gameRef);
+                if (!gameDoc.exists()) throw new Error("Game document missing");
+
+                const data = gameDoc.data();
+                // Safely parse the stringified board array from the database
+                const boardFromDb = typeof data.board === 'string' ? JSON.parse(data.board) : data.board;
+                const miniBoardWinnersFromDb = data.miniBoardWinners || Array(9).fill(null);
+                const xIsNextFromDb = data.xIsNext ?? true;
+                const nextBoardIndexFromDb = data.nextBoardIndex ?? 9;
+
+                // Validate move again inside transaction using fresh data
+                if ((xIsNextFromDb ? 'X' : 'O') !== player) throw new Error("Not your turn");
+                if (miniBoardWinnersFromDb[boardIdx] || boardFromDb[boardIdx][squareIdx]) return;
+
+                const newBoard = boardFromDb.map(mini => [...mini]);
+                newBoard[boardIdx][squareIdx] = player;
+
+                const newMiniBoardWinners = [...miniBoardWinnersFromDb];
+                let newNextBoardIndex = squareIdx;
+
+                const miniWinInfo = calculateWinner(newBoard[boardIdx]);
+                if (miniWinInfo && !newMiniBoardWinners[boardIdx]) newMiniBoardWinners[boardIdx] = player;
+                else if (isBoardFull(newBoard[boardIdx]) && !newMiniBoardWinners[boardIdx]) newMiniBoardWinners[boardIdx] = 'TIE';
+
+                // Check if the next required board is already won/tied
+                if (newMiniBoardWinners[newNextBoardIndex]) newNextBoardIndex = 9;
+
+                // Commit the update (Crucially, board is stringified again)
+                transaction.update(gameRef, {
+                    board: JSON.stringify(newBoard),
+                    miniBoardWinners: newMiniBoardWinners,
+                    xIsNext: !xIsNextFromDb,
+                    nextBoardIndex: newNextBoardIndex,
+                });
+            });
+            console.log("Move successfully committed via transaction.");
+        } catch (error) {
+            console.error("Transaction move error:", error);
+            // Optionally set a user-facing error message here based on the error
+        }
+    }, [db, gameData, currentDocId, isYourTurn, overallWinner, isDraw, waitingForOpponent, userMarker, nextBoardIndex, gameCollectionPath]);
+
+
+    // RENDER LOGIC
+    
+    let content;
+
+    if (!isAuthReady || !db) {
+        content = (
+            <div className="flex flex-col items-center justify-center p-8 bg-slate-800 rounded-xl shadow-2xl">
+                <Loader2 size={32} className="text-yellow-400 animate-spin mb-4" />
+                <p className="text-xl text-white">Connecting to Service...</p>
+            </div>
+        );
+    } else if (!playerName) {
+        content = <NameInputScreen onSetPlayerName={setPlayerName} />;
+    } else if (!currentDocId || gameStatus === 'Lobby') {
+        content = (
+            <GameLobby 
+                userId={userId} 
+                playerName={playerName} 
+                db={db} 
+                onGameJoined={handleGameJoined}
+                currentDocId={currentDocId}
+                gameData={gameData}
+                resetGame={handleResetGame}
+            />
+        );
+    } else {
+        // --- IN-GAME VIEW ---
+
+        let status;
+        let gameActive = !overallWinner && !isDraw;
+        
+        if (overallWinner) {
+            const winnerName = overallWinner === 'X' ? playerXName : playerOName;
+            const winnerColor = overallWinner === 'X' ? 'text-green-400' : 'text-red-400';
+            status = (
+                <div className={`flex items-center font-bold text-3xl ${winnerColor}`}>
+                    {winnerName} Wins the Game!
+                </div>
+            );
+        } else if (isDraw) {
+            status = <div className="text-yellow-400 font-bold text-3xl">Ultimate Draw!</div>;
+        } else if (waitingForOpponent) {
+            status = <div className="text-yellow-400 font-bold text-2xl">Waiting for Player O to join...</div>;
+        } else {
+            const currentPlayerName = xIsNext ? playerXName : playerOName;
+            const currentPlayerMarker = xIsNext ? 'X' : 'O';
+            const markerColorClass = xIsNext ? 'text-cyan-400' : 'text-pink-400';
+            
+            status = (
+                <div className="flex items-center text-white text-2xl">
+                    <span className="mr-3 font-light">
+                        {isYourTurn ? "Your Turn" : `${currentPlayerName}'s Turn`}
+                    </span>
+                    <span className={`font-bold ${markerColorClass}`}>
+                        ({currentPlayerMarker})
+                    </span>
+                </div>
+            );
+        }
+        
+        const requiredBoardMessage = nextBoardIndex === 9 
+            ? "Any open board." 
+            : `Board ${nextBoardIndex + 1}`;
+
+        content = (
+            <div className="w-full max-w-xl">
+                
+                {/* Game ID & Your ID (Separated and clearly labeled) */}
+                <div className="text-center text-sm mb-4 p-2 rounded-lg bg-slate-800/70 border border-slate-700">
+                    <p className="font-mono text-xl text-yellow-400 font-extrabold mb-1 flex items-center justify-center">
+                        <Shield size={20} className="mr-2"/> GAME ID: <span className="text-white ml-2">{currentDocId}</span>
+                    </p>
+                    <p className="font-mono text-xs text-slate-500">
+                        (Your personal User ID: <span className="select-all">{userId}</span>)
+                    </p>
+                </div>
+
+                {/* Player Legend */}
+                <div className="flex justify-center space-x-8 text-xl mb-6 p-2 bg-slate-800/70 rounded-lg border border-slate-700">
+                    <div className="flex items-center text-cyan-400 font-bold">
+                        <X size={24} className="mr-2" /> {playerXName} (X)
+                        {userMarker === 'X' && <span className="text-yellow-400 text-sm ml-2">(You)</span>}
+                    </div>
+                    <div className="flex items-center text-pink-400 font-bold">
+                        <Circle size={22} className="mr-2" /> {playerOName} (O)
+                        {userMarker === 'O' && <span className="text-yellow-400 text-sm ml-2">(You)</span>}
+                    </div>
+                </div>
+
+                {/* Status Bar */}
+                <div className="mb-6 p-4 bg-slate-800 rounded-xl shadow-2xl border border-slate-700">
+                    <div className="min-h-[40px] flex justify-center items-center mb-3">
+                        {status}
+                    </div>
+                    
+                    {gameActive && !waitingForOpponent && (
+                        <p className="text-lg text-yellow-300 text-center font-medium mb-4">
+                            Forced Move: <span className="text-white">{requiredBoardMessage}</span>
+                        </p>
+                    )}
+
+                    {/* Exit/Reset Button */}
+                    <div className="flex justify-center">
+                        <button
+                            onClick={handleResetGame}
+                            className="flex items-center px-6 py-2 bg-slate-600 text-white rounded-full font-bold shadow-md hover:bg-slate-500 transition-colors duration-200"
+                        >
+                            <RefreshCcw size={18} className="mr-2" />
+                            {overallWinner || isDraw ? 'Start New Game' : 'Return to Lobby'}
+                        </button>
+                    </div>
+                </div>
+
+                {/* Game Board */}
+                <div className="grid grid-cols-3 gap-3 aspect-square bg-slate-900/50 p-3 rounded-xl shadow-2xl border-4 border-slate-700">
+                    {board.map((miniBoardSquares, i) => (
+                        <MiniBoard
+                            key={i}
+                            boardId={i}
+                            squares={miniBoardSquares}
+                            winner={miniBoardWinners[i]}
+                            isNextBoard={isYourTurn && (nextBoardIndex === i || nextBoardIndex === 9)}
+                            overallWinner={overallWinner}
+                            onSquareClick={handleClick}
+                        />
+                    ))}
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-start py-8 px-4">
+            <h1 className="text-4xl font-extrabold text-white mb-8 text-center tracking-wider">
+                ULTIMATE TIC TAC TOE
+            </h1>
+            {content}
+            <div className="mt-8 text-sm text-slate-400 bg-slate-800/50 p-4 rounded-lg w-full max-w-xl">
+                <h3 className="text-base font-bold text-white mb-2">Multiplayer Tip:</h3>
+                <p className="space-y-1">
+                    The move logic now uses a **Firestore Transaction (`runTransaction`)**. This is a powerful, production-ready technique that ensures all game logic and updates are atomic, preventing any race conditions when both players try to make a move simultaneously!
+                </p>
+            </div>
+        </div>
+    );
+};
+
+export default App;
+
